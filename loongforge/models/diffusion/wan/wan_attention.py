@@ -404,6 +404,48 @@ class WanCrossAttention(CrossAttention):
         else:
             self.k_layernorm = None
 
+        self.has_image_input = getattr(self.config, "has_image_input", False)
+        if self.has_image_input:
+            self.linear_k_img = build_module(
+                submodules.linear_k_img,
+                self.config.hidden_size,
+                self.config.hidden_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=self.config.add_bias_linear or self.config.add_qkv_bias,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="k_img",
+                tp_group=self.pg_collection.tp,
+            )
+            self.linear_v_img = build_module(
+                submodules.linear_v_img,
+                self.config.hidden_size,
+                self.config.hidden_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=self.config.add_bias_linear or self.config.add_qkv_bias,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="v_img",
+                tp_group=self.pg_collection.tp,
+            )
+            if submodules.k_img_layernorm is not None:
+                self.k_img_layernorm = build_module(
+                    submodules.k_img_layernorm,
+                    hidden_size=self.config.hidden_size,
+                    config=self.config,
+                    eps=self.config.layernorm_epsilon,
+                )
+            else:
+                self.k_img_layernorm = None
+        else:
+            self.linear_k_img = None
+            self.linear_v_img = None
+            self.k_img_layernorm = None
+
     def forward(
         self,
         hidden_states,
@@ -424,6 +466,13 @@ class WanCrossAttention(CrossAttention):
         """
         Perform a forward pass through the cross-attention module.
         """
+        img_states = None
+        if self.has_image_input:
+            if key_value_states is None or key_value_states.shape[0] < 257:
+                raise ValueError("Wan2.1 I2V cross-attention requires 257 CLIP image tokens before text tokens.")
+            img_states = key_value_states[:257]
+            key_value_states = key_value_states[257:]
+
         query, key, value = self.get_query_key_value_tensors(
             hidden_states, key_value_states
         )
@@ -520,6 +569,22 @@ class WanCrossAttention(CrossAttention):
             if saved_num_attn_heads is not None:
                 self.core_attention.num_attention_heads = saved_num_attn_heads // ulysses_degree
 
+        disable_core_cp = (
+            self.has_image_input
+            and not thd_mode
+            and hasattr(self.core_attention, 'cp_group')
+            and self.core_attention.cp_group is not None
+        )
+        if disable_core_cp:
+            saved_cp_group = self.core_attention.cp_group
+            saved_cp_global_ranks = getattr(self.core_attention, 'cp_global_ranks', None)
+            saved_cp_comm_type = getattr(self.core_attention, 'cp_comm_type', None)
+            self.core_attention.cp_group = None
+            if hasattr(self.core_attention, 'cp_global_ranks'):
+                self.core_attention.cp_global_ranks = None
+            if hasattr(self.core_attention, 'cp_comm_type'):
+                self.core_attention.cp_comm_type = None
+
         core_attn_out = self.core_attention(
             query,
             key,
@@ -529,6 +594,21 @@ class WanCrossAttention(CrossAttention):
             attention_bias=attention_bias,
             packed_seq_params=attn_packed_seq_params,
         )
+        if img_states is not None:
+            img_key, img_value = self.get_image_key_value_tensors(img_states)
+            if thd_mode and img_key.dim() == 4:
+                img_key = img_key.squeeze(1)
+                img_value = img_value.squeeze(1)
+            image_attn_out = self.core_attention(
+                query,
+                img_key,
+                img_value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=None,
+            )
+            core_attn_out = core_attn_out + image_attn_out
 
         if ulysses_group is not None:
             # [Packing][CP][Ulysses] Invert pre-attention a2a: scatter sequence, gather heads.
@@ -579,6 +659,8 @@ class WanCrossAttention(CrossAttention):
             k_all = norm_func(k_all_norm_in).reshape_as(k_all)
             return torch.stack((k_all, v_all), dim=-2).reshape_as(full_kv)
 
+        target_dtype = next(self.linear_kv.parameters()).dtype
+        key_value_states = key_value_states.to(dtype=target_dtype)
         mixed_kv, _ = self.linear_kv(key_value_states)
         mixed_kv = norm_k(mixed_kv, self.k_layernorm)
         new_tensor_shape = mixed_kv.size()[:-1] + (
@@ -597,3 +679,20 @@ class WanCrossAttention(CrossAttention):
         query = query.view(*new_tensor_shape)
 
         return query, key, value
+
+    def get_image_key_value_tensors(self, image_states):
+        """Derives image key/value tensors from CLIP image states."""
+        target_dtype = next(self.linear_k_img.parameters()).dtype
+        image_states = image_states.to(dtype=target_dtype)
+        key, _ = self.linear_k_img(image_states)
+        if self.k_img_layernorm is not None:
+            key = self.k_img_layernorm(key)
+        value, _ = self.linear_v_img(image_states)
+
+        new_tensor_shape = key.size()[:-1] + (
+            self.num_attention_heads_per_partition,
+            self.hidden_size_per_attention_head,
+        )
+        key = key.view(*new_tensor_shape)
+        value = value.view(*new_tensor_shape)
+        return key, value

@@ -37,6 +37,14 @@ class TensorDataset(torch.utils.data.Dataset):
         # data_id = 0
         path = self.data_paths[data_id]
         data = torch.load(path, weights_only=False, map_location="cpu")
+        args = get_args()
+        if getattr(args, "model_name", None) == "wan2-1-i2v":
+            keep_keys = {
+                "context", "input_latents", "y", "clip_feature",
+                "height", "width", "num_frames",
+                "max_timestep_boundary", "min_timestep_boundary",
+            }
+            data = {key: value for key, value in data.items() if key in keep_keys}
         # used for generate timestep
         data["seed"] = seed
         return data

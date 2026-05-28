@@ -37,6 +37,7 @@ class WanConfig(BaseModelStditConfig):
     num_query_groups: int = 1
     position_embedding_type: str = "learned_absolute"
     rotary_interleaved: bool = False
+    use_fused_wan_rope: bool = False
     normalization: str = "RMSNorm"
 
     vae_temporal_compress: int = 4
